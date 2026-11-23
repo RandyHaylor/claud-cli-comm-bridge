@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Creates ~/remote-sessions/<new chat id>/, opens a new terminal there and starts
-# Claude Code with that session name.
+# Creates ~/remote-sessions/<new chat id>/ and starts Claude Code there with that session name,
+# inside the bridge's tmux server, in a new visible terminal window.
 # Usage: new_remote_session.sh [session-name]   (default name: remote-<chat id>)
 set -euo pipefail
 
@@ -9,8 +9,7 @@ session_name="${1:-remote-${chat_id}}"
 session_directory="${HOME}/remote-sessions/${chat_id}"
 
 mkdir -p "${session_directory}"
-gnome-terminal --working-directory="${session_directory}" --title="${session_name}" \
-  -- bash -lc 'claude --name "$1"; exec bash' _ "${session_name}"
+"$(dirname "$0")/open_claude_in_tmux_window.sh" "${session_name}" "${session_directory}"
 
 echo "chat id: ${chat_id}"
 echo "folder: ${session_directory}"

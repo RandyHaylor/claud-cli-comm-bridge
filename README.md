@@ -4,7 +4,7 @@ A tiny GET-only HTTP bridge that lets any outside system or agent, including web
 
 This is an experiment / prototype. Plain Python standard library, no dependencies.
 
-Requires Linux with gnome-terminal for `/launch` and `/fork` (they open new gnome-terminal windows).
+Requires Linux with gnome-terminal and tmux for `/launch`, `/fork` and `/keys`. Sessions they start run inside the bridge's own tmux server (`tmux -L claude-bridge`), with a visible gnome-terminal window attached, so the bridge can type into them later.
 
 ## How it works
 
@@ -47,8 +47,9 @@ Public port (all except `/` and `/robots.txt` need `token=`):
 | `/sessions?token=T` | Running sessions: `name`, `short_id` (first 8 chars of the session id), `status`, `kind`, `started`. |
 | `/send?token=T&msg=TEXT[&to=NAME_OR_SHORT_ID][&wait=SECONDS]` | Queues a message. Returns at once with status `processing` and a poll link; `wait=` (max 55) holds the request open for an inline reply. `to=echo` answers `pong: TEXT` immediately. A name shared by several running sessions is refused as ambiguous, listing the matches with their short ids. An unknown target is refused. |
 | `/reply?token=T&id=ID` | The reply, or status `processing`. |
-| `/launch?token=T&name=NAME` | Opens a new gnome-terminal running `claude --name NAME` in a new folder `~/remote-sessions/<chat id>/`. Refuses a name already used by a running session or launched since the server started. |
-| `/fork?token=T&from=NAME_OR_SHORT_ID&name=NEW_NAME` | Opens a new gnome-terminal in the source session's folder running `claude --resume <source session id> --fork-session --name NEW_NAME`. Same name rules as `/launch`. Refused if the source has no saved conversation yet. |
+| `/launch?token=T&name=NAME` | Starts `claude --name NAME` in a new folder `~/remote-sessions/<chat id>/`, inside the bridge tmux server, and opens a gnome-terminal window attached to it. Refuses a name already used by a running session or launched since the server started. |
+| `/fork?token=T&from=NAME_OR_SHORT_ID&name=NEW_NAME` | Same, but in the source session's folder running `claude --resume <source session id> --fork-session --name NEW_NAME`. Same name rules as `/launch`. Refused if the source has no saved conversation yet. |
+| `/keys?token=T&to=NAME_OR_SHORT_ID&text=TEXT` | Types TEXT into the session's prompt and presses Enter, e.g. `text=/compact`. Only works for sessions started by `/launch` or `/fork` (they run inside the bridge tmux server); any other session is refused with a clear error. |
 
 Local port (127.0.0.1 only, for the middleman):
 
@@ -59,9 +60,24 @@ Local port (127.0.0.1 only, for the middleman):
 
 Names for `/launch` and `/fork`: 1-64 letters, digits, dot, dash or underscore.
 
+## Operating modes
+
+### Separate middleman
+
+The setup in Quick start: a dedicated Claude Code session runs the watcher and relays messages to other sessions.
+
+### No separate middleman: your current session runs the watcher
+
+The session you are already working in runs `watch_pending.py` itself and answers or relays bridge messages alongside its normal work. Every message it handles adds to its context, so when that context gets heavy it has two ways to keep going:
+
+- **Compact it with `/keys`.** `/keys?to=<this session>&text=/compact` types `/compact` into its prompt. This only works if the session was started by the bridge (`/launch` or `/fork`), because only those run inside the bridge tmux server. To use this mode with a session you started by hand, first `/fork` it and continue in the fork.
+- **Hand the watcher role to a new session.** Start a new session with `/launch`, or `/fork` the current one to carry its context over. The new session starts running the watcher, and the old one stops. Messages without `to=` go to whichever session is running the watcher, so nothing else has to change. If the new session should also be reachable by the middleman name, start the server with `BRIDGE_MIDDLEMAN_SESSION_NAME` set to the new name.
+
+Sending `/compact` as a peer message (SendMessage) does **not** work. Verified: it arrives as plain message text, and the session does not compact. Built-in commands like `/compact` run only when typed into the session's prompt, which is what `/keys` does.
+
 ## Notes
 
-- Launched and forked sessions get a cleaned environment: every variable starting with `CLAUDE` and `AI_AGENT` is removed, so a server started from inside a Claude Code session doesn't mark new windows as child sessions (which turns off transcript saving and keeps them out of `~/.claude/sessions`). `CLAUDE_CODE_TMPDIR` is kept on purpose: on hosts where the default temp folder is unusable, Claude Code refuses to start without it.
+- Launched and forked sessions get a cleaned environment: every variable starting with `CLAUDE` and `AI_AGENT` is removed (both before tmux and again inside the tmux session, since an already-running tmux server keeps its own environment), so a server started from inside a Claude Code session doesn't mark new windows as child sessions (which turns off transcript saving and keeps them out of `~/.claude/sessions`). `CLAUDE_CODE_TMPDIR` is kept on purpose: on hosts where the default temp folder is unusable, Claude Code refuses to start without it.
 - A session only saves its conversation after its first input. Until then it can't be forked (`/fork` says so).
 - A `--fork-session` fork is likewise not written to disk until its first input.
 

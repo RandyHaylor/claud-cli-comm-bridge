@@ -18,6 +18,11 @@ Public port (exposed through a tunnel), every request needs ?token=:
   GET /fork?token=T&from=SESSION_NAME_OR_SHORT_ID&name=NEW_SESSION_NAME
       Opens a new terminal in the source session's folder running
       claude --resume <source session id> --fork-session --name NEW_SESSION_NAME.
+  /launch and /fork start Claude inside the bridge's own tmux server (tmux -L claude-bridge) and
+  open a visible terminal attached to it, so /keys can type into those sessions later.
+  GET /keys?token=T&to=SESSION_NAME_OR_SHORT_ID&text=TEXT
+      Types TEXT into the session and presses Enter (e.g. text=/compact). Works only for sessions
+      started by /launch or /fork, which run inside the bridge's tmux server.
   GET /reply?token=T&id=MESSAGE_ID
       Returns the reply for a message, or status "waiting".
 
@@ -48,6 +53,8 @@ launched_session_names = set()  # names started through /launch or /fork since t
 
 
 LAUNCH_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "new_remote_session.sh")
+TMUX_WINDOW_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "open_claude_in_tmux_window.sh")
+BRIDGE_TMUX_SERVER = "claude-bridge"  # tmux -L socket name; must match open_claude_in_tmux_window.sh
 SESSION_REGISTRY_DIRECTORY = os.path.expanduser("~/.claude/sessions")
 PROJECTS_DIRECTORY = os.path.expanduser("~/.claude/projects")
 
@@ -69,6 +76,7 @@ def list_running_sessions():
         sessions.append({
             "name": entry["name"],
             "short_id": entry.get("sessionId", "")[:8],
+            "pid": int(entry["pid"]),
             "session_id": entry.get("sessionId", ""),
             "cwd": entry.get("cwd", ""),
             "status": entry.get("status"),
@@ -76,6 +84,26 @@ def list_running_sessions():
             "started": time.strftime("%Y-%m-%d %H:%M", time.localtime(entry.get("startedAt", 0) / 1000)),
         })
     return sorted(sessions, key=lambda session: session["name"])
+
+
+def find_bridge_tmux_pane_for_process(process_id):
+    """Returns the bridge tmux pane id whose shell is an ancestor of process_id, or None."""
+    listing = subprocess.run(["tmux", "-L", BRIDGE_TMUX_SERVER, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}"],
+                             capture_output=True, text=True, timeout=10)
+    if listing.returncode != 0:
+        return None  # no bridge tmux server running
+    pane_id_by_shell_process = dict(line.split() for line in listing.stdout.splitlines() if line.strip())
+    current_process = str(process_id)
+    while current_process not in ("0", "1"):
+        if current_process in pane_id_by_shell_process:
+            return pane_id_by_shell_process[current_process]
+        try:
+            with open(f"/proc/{current_process}/stat") as stat_file:
+                # the parent pid is the 2nd field after the parenthesised command name
+                current_process = stat_file.read().rsplit(")", 1)[1].split()[1]
+        except OSError:
+            return None
+    return None
 
 
 def public_session_view(session):
@@ -147,6 +175,8 @@ class PublicHandler(BaseHTTPRequestHandler):
             return self.handle_launch(query)
         if url.path == "/fork":
             return self.handle_fork(query)
+        if url.path == "/keys":
+            return self.handle_keys(query)
         if url.path == "/sessions":
             return write_json(self, 200, {"default_to": MIDDLEMAN_SESSION_NAME,
                                           "sessions": [public_session_view(session)
@@ -214,15 +244,33 @@ class PublicHandler(BaseHTTPRequestHandler):
                 "error": "source session has no saved conversation yet; send it a message first"})
         launched_session_names.add(session_name)
         result = subprocess.run(
-            ["gnome-terminal", f"--working-directory={source_session['cwd']}", f"--title={session_name}", "--",
-             "bash", "-lc", 'claude --resume "$1" --fork-session --name "$2"; exec bash', "_",
-             source_session["session_id"], session_name],
+            [TMUX_WINDOW_SCRIPT_PATH, session_name, source_session["cwd"],
+             "--resume", source_session["session_id"], "--fork-session"],
             capture_output=True, text=True, timeout=30, env=environment_without_claude_markers())
         if result.returncode != 0:
             return write_json(self, 500, {"error": "fork failed", "detail": result.stderr.strip()})
         return write_json(self, 200, {
             "status": "forked", "name": session_name, "from": public_session_view(source_session),
             "note": "the fork is written to disk only after its first input"})
+
+    def handle_keys(self, query):
+        session, error = resolve_session(query.get("to", ""))
+        if error:
+            return write_json(self, 409 if "matches" in error else 404, error)
+        text = query.get("text", "")
+        if not text:
+            return write_json(self, 400, {"error": "need text="})
+        tmux_pane = find_bridge_tmux_pane_for_process(session["pid"])
+        if not tmux_pane:
+            return write_json(self, 409, {
+                "error": f"{session['name']} is not running inside a bridge tmux session; "
+                         "only sessions started with /launch or /fork can receive keys"})
+        # -l types the text literally; Enter is sent separately so it is pressed, not typed.
+        for keys_arguments in (["-l", text], ["Enter"]):
+            subprocess.run(["tmux", "-L", BRIDGE_TMUX_SERVER, "send-keys", "-t", tmux_pane, *keys_arguments],
+                           check=True, timeout=10)
+            time.sleep(0.3)
+        return write_json(self, 200, {"status": "sent", "to": public_session_view(session), "text": text})
 
     def handle_reply(self, query):
         with messages_lock:
