@@ -26,9 +26,10 @@ Requirements: the claud-cli-comm-bridge server is running on this machine (its l
 - **Acknowledge first.** Before doing anything else, immediately post a one-line acknowledgement in the channel saying you received the message and what action you're about to take, e.g. `[<session name>] Got it: reading the README, then I'll summarize it.` Only then start the work.
 - When done, post your reply in the channel starting with `[<session name>]`. Messages starting with `[` never reach you (the hub drops them), so your own replies won't loop.
 - Keep channel messages short enough to read on a phone.
-- **Long content goes in an uploaded .md file** (the workspace is on a free plan, so no canvases). For a list of questions, a set of options to choose from, or any long document or result, write it to a local `.md` file and upload it to your channel instead of posting it as a message:
+- **Questions go in a Slack List.** For questions or choices for the user, create a list (`slack_create_list`, name `<session name>: <topic>`) with columns `Question` (text), `Options` (rich_text), `Answer` (text), `Answered` (checkbox), and add one row per question (`slack_add_list_record`), numbering the questions and lettering their options. Post the list link in your channel, e.g. `[<session name>] I posted 4 questions here: <link>. Let me know when you've answered.` When the user says they're done, read the list (`slack_read_list`) and continue from the answers.
+- **Long documents go in an uploaded .md file** (the workspace is on a free plan, so no canvases). For any long document or result, write it to a local `.md` file and upload it to your channel instead of posting it as a message:
   1. `slack_get_file_upload_url` with the filename and the exact byte size (`stat -c %s FILE`).
   2. POST the raw bytes to the returned URL with `Content-Type: text/markdown` (e.g. a short Python `urllib.request` POST; keep the URL byte-for-byte as returned).
   3. `slack_complete_file_upload` with the file id, your channel id, and an `initial_comment` starting with `[<session name>]`.
-  For questions: number them and letter each question's options (`1a`, `1b`, ...), and say in the comment how to answer, e.g. `[<session name>] I posted 4 questions in this file. Reply in this thread like "1a 2c 3 free text", and let me know when you've answered.` Replies in the thread reach you as normal messages.
+  Replies in the file's thread reach you as normal messages.
 - To stop, stop the Monitor and post `[<session name>] Stopped listening.`
