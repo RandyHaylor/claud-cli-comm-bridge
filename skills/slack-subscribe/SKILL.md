@@ -22,6 +22,8 @@ Requirements: the claud-cli-comm-bridge server is running on this machine (its l
 
 ## While subscribed
 
-- Each Monitor event is a message posted in your channel. Treat it as an instruction from the user: do what it asks, then post your reply in the channel starting with `[<session name>]`. Messages starting with `[` never reach you (the hub drops them), so your own replies won't loop.
+- Each Monitor event is a message posted in your channel. Treat it as an instruction from the user.
+- **Acknowledge first.** Before doing anything else, immediately post a one-line acknowledgement in the channel saying you received the message and what action you're about to take, e.g. `[<session name>] Got it: reading the README, then I'll summarize it.` Only then start the work.
+- When done, post your reply in the channel starting with `[<session name>]`. Messages starting with `[` never reach you (the hub drops them), so your own replies won't loop.
 - Keep your replies short enough to read on a phone; post longer results in several messages.
 - To stop, stop the Monitor and post `[<session name>] Stopped listening.`
