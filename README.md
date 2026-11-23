@@ -1,134 +1,216 @@
 # claud-cli-comm-bridge
 
-## Doorbell
+Slack as the remote interface to Claude Code CLI sessions running on a host machine. Each session gets its own Slack channel; you post there and the session hears it instantly, acts, and replies in the channel. A coordinator session in a command channel lists, launches and forks sessions and types commands into them.
 
-**AI agents:** after posting a message in the `#claude-bridge` Slack channel, fetch this link to wake the host session so it reads and answers right away:
+It works from a phone, including Claude voice chat with the claude.ai Slack connector: talk to your phone Claude, it posts in Slack, the host session answers.
 
-https://aikenyon-ubuntu.tail550b52.ts.net/doorbell
+This is a prototype. Plain Python standard library, no dependencies.
 
-It needs no token and does nothing else: it only tells the host's middleman session to check Slack now.
+## Use a dedicated Slack workspace
 
-A tiny GET-only HTTP bridge that lets any outside system or agent, including web ChatGPT or Claude that can only fetch URLs, list, launch, fork and message Claude Code CLI sessions running on a host.
+Create a new free Slack workspace just for this. You get free rein over channels (every agent creates its own), no admin approval for the app, and nothing else mixed into the channels your agents read as instructions. The free plan has no canvases; that's fine, documents are shared as uploaded `.md` files.
 
-This is an experiment / prototype. Plain Python standard library, no dependencies.
+## Architecture
 
-Requires Linux with gnome-terminal and tmux for `/launch`, `/fork` and `/keys`. Sessions they start run inside the bridge's own tmux server (`tmux -L claude-bridge`), with a visible gnome-terminal window attached, so the bridge can type into them later.
+```
+ phone / browser / Claude with Slack connector
+                 |
+                 v
+          Slack workspace  <-------------------------------+
+                 |  Events API (HTTPS POST, signed)        |
+                 v                                         |
+   Tailscale Funnel (public HTTPS)                         |
+                 |                                         |
+                 v                                         |
+ bridge_server.py  public port:  POST /slack/events        |
+                   local port (127.0.0.1):                 |
+                     /slack/messages  /slack/wait          |
+                     /sessions /launch /fork /keys         |
+                 ^                    |                    |
+   slack_listen.py (under Monitor)    | tmux -L claude-bridge
+                 |                    v                    |
+       Claude Code sessions  <--  bridge-launched sessions |
+                 |   (gnome-terminal windows)              |
+                 +--- claude.ai Slack connector (MCP) -----+
+                      replies, uploads, channel creation
+```
 
-## How it works
+- Slack pushes every message in channels the bot is in to `POST /slack/events`. The server verifies Slack's signature and keeps the last 1000 messages in memory.
+- Each session runs `slack_listen.py --channel <id>` under its Monitor tool and is woken per message.
+- Sessions post through the claude.ai Slack connector, so all posts appear as the workspace owner. Agents start every post with a tag `[name · short id · folder]`, and the hub drops messages starting with `[`, so agents never hear their own replies.
 
-- `bridge_server.py` runs two ports:
-  - a public port, exposed to the internet through a tunnel; every request needs `?token=`
-  - a local-only port (127.0.0.1) for the middleman
-- The list of running sessions is read straight from Claude Code's registry files in `~/.claude/sessions/`.
-- Messages are relayed by a **middleman**: a normal Claude Code session on the host that runs `watch_pending.py` (prints one JSON line per queued message) and passes each message to its target session with its SendMessage tool. It then posts the reply back with `/respond`.
-- Sessions don't reply to peer messages on their own, so the middleman must explicitly ask the target session to reply.
-- Messages sent without `to=` go to the middleman itself, which answers them.
+## Requirements
 
-## Quick start
+- Linux with gnome-terminal and tmux
+- Python 3
+- Claude Code, with the claude.ai Slack connector
+- Tailscale (or another HTTPS tunnel that Slack can reach)
 
-1. From a normal terminal (not from inside Claude Code), start the server:
+## Setup
+
+### a. Create the workspace
+
+At slack.com, create a new workspace (free plan).
+
+### b. Public HTTPS with Tailscale Funnel
+
+```
+sudo tailscale up
+```
+
+Enable Funnel for your tailnet in the Tailscale admin console (the CLI prints a link if it isn't enabled). Let your user run tailscale without sudo, then expose the bridge's public port (default 8787):
+
+```
+sudo tailscale set --operator=$USER
+tailscale funnel --bg 8787
+```
+
+Your public URL is `https://<machine>.<tailnet>.ts.net`.
+
+### c. Create the Slack app from the manifest
+
+At api.slack.com/apps: Create New App -> From a manifest, pick your workspace, and paste `slack_app_manifest.yaml` with `YOUR-HOST` replaced by your Funnel host. Install the app to the workspace.
+
+Gotcha: the "From scratch" wizard may turn Socket Mode on. Socket Mode must be OFF (Settings -> Socket Mode), or events never reach the Request URL.
+
+### d. Signing secret
+
+Copy the Signing Secret from the app's Basic Information page. Write it without putting it on the command line or in shell history: the `read -s` prompt hides what you paste.
+
+```
+mkdir -p ~/.config/claude-bridge
+read -s -p "Signing secret: " secret && printf 'SLACK_SIGNING_SECRET=%s\n' "$secret" > ~/.config/claude-bridge/slack.env; unset secret
+chmod 600 ~/.config/claude-bridge/slack.env
+```
+
+The server reads it on every request (no restart needed). Without it, every event is refused.
+
+### e. Start the server
+
+From a normal terminal, not inside a Claude Code session:
+
+```
+BRIDGE_PUBLIC_PORT=8787 BRIDGE_LOCAL_PORT=8788 python3 bridge_server.py
+```
+
+Both variables are optional (defaults 8787 and 8788). The public port is the one Funnel exposes.
+
+### f. Verify the Request URL
+
+In the app's Event Subscriptions page, the Request URL `https://YOUR-HOST/slack/events` must show Verified. If it doesn't, check the server is running, Funnel is on, and the secret file is right, then click Retry.
+
+### g. Command channel and bot id
+
+1. Create the channel `#claude-bridge` and type `/invite @claude-bridge` in it. Slack only sends a channel's events once the bot is a member.
+2. Save the bot's member id (starts with `U`). Get it by listing the channel's members through the Slack connector, or from the bot's profile -> Copy member ID:
 
    ```
-   BRIDGE_TOKEN=pick-a-long-secret python3 bridge_server.py
+   echo U0XXXXXXXXX > ~/.config/claude-bridge/slack_bot_user_id
    ```
 
-   Defaults: public port 8787, local port 8788. Override with `BRIDGE_PUBLIC_PORT` / `BRIDGE_LOCAL_PORT`. Without `BRIDGE_TOKEN` a random token is generated and printed.
+3. Optional, if you changed the local port: `echo 8788 > ~/.config/claude-bridge/local_port`. The skills read it.
 
-2. Start a tunnel to the public port. What worked:
+### h. Install the skills
 
-   ```
-   ssh -R 80:127.0.0.1:8787 nokey@localhost.run
-   ```
+```
+ln -s "$PWD/skills/slack-subscribe" ~/.claude/skills/slack-subscribe
+ln -s "$PWD/skills/slack-coordinator" ~/.claude/skills/slack-coordinator
+```
 
-3. Open a Claude Code session in this folder and ask it to be the middleman: monitor `python3 watch_pending.py`, deliver each message to its target session with SendMessage (asking the target to reply), and post the reply to `http://127.0.0.1:8788/respond?id=ID&text=REPLY`. Name the session `bridge-middleman`, or set `BRIDGE_MIDDLEMAN_SESSION_NAME` to its name.
+### i. Sign sessions into the Slack connector
 
-4. Give the outside agent the tunnel URL and token, e.g. `https://<tunnel host>/sessions?token=...`.
+In each Claude Code session that should use Slack, run `/mcp` and sign in to the claude.ai Slack connector.
 
-## Endpoints
+## Usage
 
-Public port (all except `/` and `/robots.txt` need `token=`):
+- **Coordinator:** in one Claude Code session, run `/slack-coordinator`. It listens on `#claude-bridge` (or a channel you name).
+- **Subscribe a session:** run `/slack-subscribe` in it. It creates (or reuses) its own channel `<name>-<short id>` with the bot invited, and listens there.
+- **Talk to an agent:** post in its channel.
+
+### Commands in #claude-bridge
+
+| Command | What it does |
+|---|---|
+| `sessions` | Lists the running sessions. |
+| `launch NAME` | Starts a new session named NAME in `~/remote-sessions/<chat id>/`, in a visible terminal. |
+| `fork FROM NAME` | Forks session FROM (name or short id) into a new session NAME, in FROM's folder. |
+| `keys TO text…` | Types the text into session TO and presses Enter (e.g. `keys my-session /compact`). Only for sessions started by launch or fork. |
+| `subscribe NAME` | Types `/slack-subscribe` into session NAME. Only for sessions started by launch or fork; otherwise type `/slack-subscribe` in that session yourself. |
+
+Anything else is answered by the coordinator itself.
+
+### Conventions
+
+- Every agent post starts with its tag: `[name · short id · folder]`.
+- Agents acknowledge first (one line saying what they're about to do), then act.
+- Questions come in an uploaded `questions<N>.md` file, numbered, with lettered options. Answer in the main channel without repeating the questions: `questions3.md response: 1a, 2b. 3c: "free text"`.
+- Long documents come as uploaded `.md` files.
+- No threads: everything is in the main channel.
+
+## Suggested channel content
+
+### #readme
+
+```
+This workspace is the remote interface to Claude Code sessions on a host machine. Humans and AI agents (for example a phone Claude with the Slack connector) are welcome.
+
+- Each agent has its own channel named <session name>-<short id>. Post there to talk to it; it replies in the same channel.
+- Agent posts start with a tag: [name · short id · folder]. Your own messages must NOT start with "[" or the agents never see them.
+- Agents acknowledge first, then act.
+- Questions arrive as questions<N>.md files. Answer in the main channel: questions3.md response: 1a, 2b. 3c: "free text"
+- Long documents arrive as .md files.
+- Never use threads; agents only read the main channel.
+- To list, start or control sessions, use #claude-bridge. See #command-list.
+```
+
+### #command-list
+
+```
+Commands for #claude-bridge (post one per message):
+sessions              list running sessions
+launch NAME           start a new session named NAME
+fork FROM NAME        fork session FROM into a new session NAME
+keys TO text...       type text into session TO and press Enter (e.g. keys my-session /compact); bridge-launched sessions only
+subscribe NAME        make session NAME subscribe to its own channel; bridge-launched sessions only
+Anything else is answered by the coordinator.
+```
+
+### Suggested claude.ai personal preference
+
+```
+To talk to my Claude Code agents, use Slack: read #readme first and follow it.
+```
+
+## Local endpoints
+
+Bound to 127.0.0.1, no token, never tunneled.
 
 | Endpoint | What it does |
 |---|---|
-| `/robots.txt` | Allows all fetchers. |
-| `/` | Usage text. |
-| `/sessions?token=T` | Running sessions: `name`, `short_id` (first 8 chars of the session id), `status`, `kind`, `started`. |
-| `/send?token=T&msg=TEXT[&to=NAME_OR_SHORT_ID][&wait=SECONDS]` | Queues a message. Returns at once with status `processing` and a poll link; `wait=` (max 55) holds the request open for an inline reply. `to=echo` answers `pong: TEXT` immediately. A name shared by several running sessions is refused as ambiguous, listing the matches with their short ids. An unknown target is refused. |
-| `/reply?token=T&id=ID` | The reply, or status `processing`. |
-| `/launch?token=T&name=NAME` | Starts `claude --name NAME` in a new folder `~/remote-sessions/<chat id>/`, inside the bridge tmux server, and opens a gnome-terminal window attached to it. Refuses a name already used by a running session or launched since the server started. |
-| `/fork?token=T&from=NAME_OR_SHORT_ID&name=NEW_NAME` | Same, but in the source session's folder running `claude --resume <source session id> --fork-session --name NEW_NAME`. Same name rules as `/launch`. Refused if the source has no saved conversation yet. |
-| `/keys?token=T&to=NAME_OR_SHORT_ID&text=TEXT` | Types TEXT into the session's prompt and presses Enter, e.g. `text=/compact`. Only works for sessions started by `/launch` or `/fork` (they run inside the bridge tmux server); any other session is refused with a clear error. |
+| `GET /slack/messages[?channel=ID][&since=TS]` | Stored messages newer than Slack ts `since`. |
+| `GET /slack/wait[?channel=ID][&since=TS][&timeout=SECONDS]` | Same, but blocks (max 50 s) until one arrives. Returns `messages` and `latest_ts` for the next `since`. |
+| `GET /sessions` | Running sessions: `name`, `short_id`, `status`, `kind`, `started`. |
+| `GET /launch?name=NAME` | New session in `~/remote-sessions/<chat id>/` inside `tmux -L claude-bridge`, with a gnome-terminal attached. Names: 1-64 letters, digits, dot, dash, underscore; refused if already running or launched. |
+| `GET /fork?from=NAME_OR_SHORT_ID&name=NEW_NAME` | `claude --resume <id> --fork-session` in the source's folder. Refused until the source has a saved conversation (after its first input). |
+| `GET /keys?to=NAME_OR_SHORT_ID&text=TEXT` | Types TEXT and Enter into a bridge-launched session; any other session is refused. |
 
-Local port (127.0.0.1 only, for the middleman):
+`slack_listen.py [--channel ID] [--since TS]` prints one JSON line per new message from `/slack/wait`, and keeps retrying while the server is down. Set `BRIDGE_LOCAL_PORT` if the local port isn't 8788.
 
-| Endpoint | What it does |
-|---|---|
-| `/pending` | Messages not yet handed out. Each carries the target's `name`, `short_id`, `session_id` and `cwd`, so the middleman can pick the right session when names are shared. |
-| `/respond?id=ID&text=REPLY` | Records the reply. |
+The public port serves only `POST /slack/events`; everything else is 404.
 
-Names for `/launch` and `/fork`: 1-64 letters, digits, dot, dash or underscore.
+## Security
 
-## Operating modes
-
-### Separate middleman
-
-The setup in Quick start: a dedicated Claude Code session runs the watcher and relays messages to other sessions.
-
-### No separate middleman: your current session runs the watcher
-
-The session you are already working in runs `watch_pending.py` itself and answers or relays bridge messages alongside its normal work. Every message it handles adds to its context, so when that context gets heavy it has two ways to keep going:
-
-- **Compact it with `/keys`.** `/keys?to=<this session>&text=/compact` types `/compact` into its prompt. This only works if the session was started by the bridge (`/launch` or `/fork`), because only those run inside the bridge tmux server. To use this mode with a session you started by hand, first `/fork` it and continue in the fork.
-- **Hand the watcher role to a new session.** Start a new session with `/launch`, or `/fork` the current one to carry its context over. The new session starts running the watcher, and the old one stops. Messages without `to=` go to whichever session is running the watcher, so nothing else has to change. If the new session should also be reachable by the middleman name, start the server with `BRIDGE_MIDDLEMAN_SESSION_NAME` set to the new name.
-
-Sending `/compact` as a peer message (SendMessage) does **not** work. Verified: it arrives as plain message text, and the session does not compact. Built-in commands like `/compact` run only when typed into the session's prompt, which is what `/keys` does.
-
-## Slack event hub
-
-Slack's Events API pushes every message in channels the bot is in to the bridge (`POST /slack/events` on the public port). Local sessions then either await new messages or poll for them. Each session has its own channel named `<session name>-<short id>`, and posts its replies there itself through its Slack connector, prefixed `[session name]`. Messages whose text starts with `[` are ignored, so sessions never hear their own replies.
-
-### Setup
-
-1. At api.slack.com/apps: Create New App -> From a manifest, paste `slack_app_manifest.yaml` with `YOUR-HOST` replaced by your bridge's public host. Slack checks the URL right away, so the bridge must already be running with the signing secret (step 2); if the check fails, retry it from the app's Event Subscriptions page.
-2. Copy the app's Signing Secret (Basic Information) into the bridge's settings file (it is read on each request, so no restart is needed):
-
-   ```
-   mkdir -p ~/.config/claude-bridge
-   echo 'SLACK_SIGNING_SECRET=...' > ~/.config/claude-bridge/slack.env
-   chmod 600 ~/.config/claude-bridge/slack.env
-   ```
-
-   Or set `SLACK_SIGNING_SECRET` in the server's environment. With no secret configured, every event is refused.
-3. Install the app to the workspace (Install App).
-4. Invite the `claude-bridge` bot to each channel to listen to (`/invite @claude-bridge`). Slack only sends a channel's events once the bot is a member.
-
-### Receiving messages (local port only)
-
-- **Await:** `python3 slack_listen.py --channel CHANNEL_ID` prints one JSON line per new message (`channel_id`, `ts`, `user`, `text`, `received_at`). Run it under the Monitor tool to be woken per message. Omit `--channel` to hear every channel. It starts from now; `--since TS` replays from a Slack ts. It keeps retrying while the server is down.
-- **Poll:** `GET /slack/messages?channel=CHANNEL_ID&since=TS` returns the messages newer than TS (`channel` optional).
-- `GET /slack/wait?channel=CHANNEL_ID&since=TS&timeout=SECONDS` blocks (max 50 s) until a matching message arrives, and returns `messages` plus `latest_ts` to pass as the next `since`.
-
-The bridge keeps the last 1000 messages in memory only; a restart empties it.
-
-### Paste into a session to subscribe it
-
-```
-Subscribe yourself to Slack: your short id is the first 8 characters of $CLAUDE_CODE_SESSION_ID. With your Slack connector, create a channel named <your session name>-<short id> and invite the claude-bridge bot user to it; note the channel ID. Run `python3 <bridge folder>/slack_listen.py --channel <channel ID>` under your Monitor tool. Treat each message it prints as an instruction from the user. Reply in that channel with your Slack connector, starting every reply with [<your session name>].
-```
-
-## Notes
-
-- Launched and forked sessions get a cleaned environment: every variable starting with `CLAUDE` and `AI_AGENT` is removed (both before tmux and again inside the tmux session, since an already-running tmux server keeps its own environment), so a server started from inside a Claude Code session doesn't mark new windows as child sessions (which turns off transcript saving and keeps them out of `~/.claude/sessions`). `CLAUDE_CODE_TMPDIR` is kept on purpose: on hosts where the default temp folder is unusable, Claude Code refuses to start without it.
-- A session only saves its conversation after its first input. Until then it can't be forked (`/fork` says so).
-- A `--fork-session` fork is likewise not written to disk until its first input.
+- The Slack signature check is what stops anyone on the internet from injecting instructions: without the signing secret, a request to `/slack/events` is refused. Keep `~/.config/claude-bridge/slack.env` private (`chmod 600`), never commit it, and rotate the secret in the Slack app if it leaks.
+- Every message in a channel the bot is in is treated by the agents as your instruction. Keep the workspace to yourself.
+- Launched and forked sessions run with your user's permissions on the host.
 
 ## Lessons learned
 
-- Cloudflare quick tunnels serve a managed robots.txt that blocks Claude-User and ChatGPT-User.
-- ngrok free shows a browser-warning interstitial that web fetchers can't get past.
-- localhost.run works, but rotates its domain and exposes the host IP in an `x-backend-addr` header.
-- Web fetch tools time out on long-held requests, so `/send` returns `processing` plus a poll link immediately.
-
-## Security warning
-
-Anyone with the URL and token can message sessions and launch or fork Claude Code sessions on your host. Tokens travel in URLs, so they end up in logs and chat histories. Use a long random token, stop the server and tunnel when you're done, and don't run this on a machine you can't afford to expose.
+- The claude.ai Slack connector can only read and post, not wait for messages, so Slack events plus a local listener are needed for instant pings.
+- Web chat fetch tools only open URLs that already appeared in the conversation, so a URL-polling design doesn't work for web Claude.
+- Cloudflare quick tunnels serve a managed robots.txt that blocks AI fetchers.
+- ngrok free shows an interstitial page that fetchers can't get past.
+- Socket Mode must be off, or events never reach the Request URL.
+- The bot must be a member of a channel to receive its events.
+- Sessions launched from inside a Claude session inherit `CLAUDE_CODE_CHILD_SESSION` and don't register in `~/.claude/sessions` unless the environment is stripped (the launch scripts strip `CLAUDE*` and `AI_AGENT`, keeping `CLAUDE_CODE_TMPDIR`).
+- `/compact` sent as a peer message arrives as plain text; built-in commands only run when typed into the prompt, which is what tmux send-keys (`keys`) does.
