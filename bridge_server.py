@@ -29,8 +29,15 @@ Public port (exposed through a tunnel), every request needs ?token=:
 Local-only port (bound to 127.0.0.1, never tunneled), used by the middleman Claude session:
   GET /pending                       messages not yet handed to a session
   GET /respond?id=MESSAGE_ID&text=T  records the reply for a message
+  GET /slack/messages[?channel=CHANNEL_ID][&since=TS]               Slack messages newer than TS
+  GET /slack/wait[?channel=CHANNEL_ID][&since=TS][&timeout=SECONDS] same, but blocks (max 50 s) until one arrives
+
+Slack Events API (public port, verified by Slack's request signature instead of a token):
+  POST /slack/events
 """
 import glob
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -38,6 +45,7 @@ import secrets
 import subprocess
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -298,6 +306,8 @@ class PublicHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Minimal MCP (Streamable HTTP, JSON responses) at /mcp/<token> with one tool: list_sessions."""
+        if urlparse(self.path).path == "/slack/events":
+            return self.handle_slack_event()
         if not secrets.compare_digest(urlparse(self.path).path, f"/mcp/{ACCESS_TOKEN}"):
             return write_json(self, 404, {"error": "unknown path"})
         request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
@@ -326,6 +336,91 @@ class PublicHandler(BaseHTTPRequestHandler):
                                           "error": {"code": -32601, "message": f"unsupported: {method}"}})
         return write_json(self, 200, {"jsonrpc": "2.0", "id": request_id, "result": result})
 
+    def handle_slack_event(self):
+        """Slack Events API receiver. Refuses everything unless Slack's signature checks out."""
+        raw_body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        signing_secret = read_slack_signing_secret()
+        if not signing_secret:
+            return write_json(self, 403, {"error": "no Slack signing secret configured; refusing all events"})
+        timestamp = self.headers.get("X-Slack-Request-Timestamp", "")
+        try:
+            timestamp_is_fresh = abs(time.time() - int(timestamp)) <= 300
+        except ValueError:
+            timestamp_is_fresh = False
+        if not timestamp_is_fresh:
+            return write_json(self, 403, {"error": "missing or stale timestamp"})
+        expected_signature = "v0=" + hmac.new(signing_secret.encode(), b"v0:" + timestamp.encode() + b":" + raw_body,
+                                              hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected_signature, self.headers.get("X-Slack-Signature", "")):
+            return write_json(self, 403, {"error": "bad signature"})
+        try:
+            payload = json.loads(raw_body)
+        except ValueError:
+            return write_json(self, 400, {"error": "body is not JSON"})
+        if payload.get("type") == "url_verification":
+            return write_json(self, 200, {"challenge": payload.get("challenge", "")})
+        event = payload.get("event", {})
+        if (payload.get("type") == "event_callback" and event.get("type") == "message"
+                and not event.get("subtype") and not event.get("bot_id")
+                and not event.get("text", "").startswith("[")):
+            store_slack_message({"channel_id": event.get("channel", ""), "ts": event.get("ts", "0"),
+                                 "user": event.get("user", ""), "text": event.get("text", ""),
+                                 "received_at": time.time()})
+        return write_json(self, 200, {"ok": True})
+
+
+SLACK_SETTINGS_FILE_PATH = os.path.expanduser("~/.config/claude-bridge/slack.env")
+SLACK_HISTORY_LIMIT = 1000
+slack_messages = []  # oldest first: {"channel_id", "ts", "user", "text", "received_at"}
+slack_messages_lock = threading.Condition()
+
+
+def read_slack_signing_secret():
+    """SLACK_SIGNING_SECRET from the environment, else from ~/.config/claude-bridge/slack.env, else ''."""
+    if os.environ.get("SLACK_SIGNING_SECRET"):
+        return os.environ["SLACK_SIGNING_SECRET"]
+    try:
+        with open(SLACK_SETTINGS_FILE_PATH) as settings_file:
+            for line in settings_file:
+                name, _, value = line.strip().partition("=")
+                if name.strip() == "SLACK_SIGNING_SECRET":
+                    return value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def slack_timestamp_value(slack_timestamp):
+    try:
+        return Decimal(slack_timestamp)
+    except (InvalidOperation, TypeError):
+        return Decimal(0)
+
+
+def store_slack_message(message):
+    """Adds a message unless Slack already delivered it (retries repeat the same channel and ts)."""
+    with slack_messages_lock:
+        if any(stored["channel_id"] == message["channel_id"] and stored["ts"] == message["ts"]
+               for stored in slack_messages):
+            return
+        slack_messages.append(message)
+        del slack_messages[:-SLACK_HISTORY_LIMIT]
+        slack_messages_lock.notify_all()
+
+
+def slack_messages_newer_than(since_timestamp, channel_id):
+    """Messages after since_timestamp, in one channel or (channel_id empty) all. Caller holds the lock."""
+    since_value = slack_timestamp_value(since_timestamp)
+    return [message for message in slack_messages
+            if slack_timestamp_value(message["ts"]) > since_value
+            and (not channel_id or message["channel_id"] == channel_id)]
+
+
+def latest_slack_timestamp(found_messages, since_timestamp):
+    if not found_messages:
+        return since_timestamp
+    return max((message["ts"] for message in found_messages), key=slack_timestamp_value)
+
 
 class LocalMiddlemanHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -347,6 +442,20 @@ class LocalMiddlemanHandler(BaseHTTPRequestHandler):
                 message["reply"] = query.get("text", "")
                 messages_lock.notify_all()
             return write_json(self, 200, {"ok": True})
+        if url.path in ("/slack/messages", "/slack/wait"):
+            since_timestamp, channel_id = query.get("since", "0"), query.get("channel", "")
+            try:
+                wait_seconds = min(max(float(query.get("timeout", "50")), 0.0), 50.0) if url.path == "/slack/wait" else 0
+            except ValueError:
+                return write_json(self, 400, {"error": "timeout= must be a number of seconds"})
+            deadline = time.time() + wait_seconds
+            with slack_messages_lock:
+                found_messages = slack_messages_newer_than(since_timestamp, channel_id)
+                while not found_messages and time.time() < deadline:
+                    slack_messages_lock.wait(timeout=deadline - time.time())
+                    found_messages = slack_messages_newer_than(since_timestamp, channel_id)
+            return write_json(self, 200, {"messages": found_messages,
+                                          "latest_ts": latest_slack_timestamp(found_messages, since_timestamp)})
         return write_json(self, 404, {"error": "unknown path"})
 
 

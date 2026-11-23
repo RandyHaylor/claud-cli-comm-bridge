@@ -83,6 +83,39 @@ The session you are already working in runs `watch_pending.py` itself and answer
 
 Sending `/compact` as a peer message (SendMessage) does **not** work. Verified: it arrives as plain message text, and the session does not compact. Built-in commands like `/compact` run only when typed into the session's prompt, which is what `/keys` does.
 
+## Slack event hub
+
+Slack's Events API pushes every message in channels the bot is in to the bridge (`POST /slack/events` on the public port). Local sessions then either await new messages or poll for them. Each session has its own channel named `<session name>-<short id>`, and posts its replies there itself through its Slack connector, prefixed `[session name]`. Messages whose text starts with `[` are ignored, so sessions never hear their own replies.
+
+### Setup
+
+1. At api.slack.com/apps: Create New App -> From a manifest, paste `slack_app_manifest.yaml` with `YOUR-HOST` replaced by your bridge's public host. Slack checks the URL right away, so the bridge must already be running with the signing secret (step 2); if the check fails, retry it from the app's Event Subscriptions page.
+2. Copy the app's Signing Secret (Basic Information) into the bridge's settings file (it is read on each request, so no restart is needed):
+
+   ```
+   mkdir -p ~/.config/claude-bridge
+   echo 'SLACK_SIGNING_SECRET=...' > ~/.config/claude-bridge/slack.env
+   chmod 600 ~/.config/claude-bridge/slack.env
+   ```
+
+   Or set `SLACK_SIGNING_SECRET` in the server's environment. With no secret configured, every event is refused.
+3. Install the app to the workspace (Install App).
+4. Invite the `claude-bridge` bot to each channel to listen to (`/invite @claude-bridge`). Slack only sends a channel's events once the bot is a member.
+
+### Receiving messages (local port only)
+
+- **Await:** `python3 slack_listen.py --channel CHANNEL_ID` prints one JSON line per new message (`channel_id`, `ts`, `user`, `text`, `received_at`). Run it under the Monitor tool to be woken per message. Omit `--channel` to hear every channel. It starts from now; `--since TS` replays from a Slack ts. It keeps retrying while the server is down.
+- **Poll:** `GET /slack/messages?channel=CHANNEL_ID&since=TS` returns the messages newer than TS (`channel` optional).
+- `GET /slack/wait?channel=CHANNEL_ID&since=TS&timeout=SECONDS` blocks (max 50 s) until a matching message arrives, and returns `messages` plus `latest_ts` to pass as the next `since`.
+
+The bridge keeps the last 1000 messages in memory only; a restart empties it.
+
+### Paste into a session to subscribe it
+
+```
+Subscribe yourself to Slack: your short id is the first 8 characters of $CLAUDE_CODE_SESSION_ID. With your Slack connector, create a channel named <your session name>-<short id> and invite the claude-bridge bot user to it; note the channel ID. Run `python3 <bridge folder>/slack_listen.py --channel <channel ID>` under your Monitor tool. Treat each message it prints as an instruction from the user. Reply in that channel with your Slack connector, starting every reply with [<your session name>].
+```
+
 ## Notes
 
 - Launched and forked sessions get a cleaned environment: every variable starting with `CLAUDE` and `AI_AGENT` is removed (both before tmux and again inside the tmux session, since an already-running tmux server keeps its own environment), so a server started from inside a Claude Code session doesn't mark new windows as child sessions (which turns off transcript saving and keeps them out of `~/.claude/sessions`). `CLAUDE_CODE_TMPDIR` is kept on purpose: on hosts where the default temp folder is unusable, Claude Code refuses to start without it.
