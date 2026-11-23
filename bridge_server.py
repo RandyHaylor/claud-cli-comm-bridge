@@ -165,9 +165,22 @@ class PublicHandler(BaseHTTPRequestHandler):
             return self.wfile.write(data)
         if url.path == "/":
             return write_json(self, 200, {"service": "claude cli comm bridge", "usage": __doc__})
+        if url.path == "/doorbell":
+            # Public on purpose: needs no token and can only ask the middleman to check Slack.
+            message_id = secrets.token_hex(6)
+            with messages_lock:
+                messages[message_id] = {"to": MIDDLEMAN_SESSION_NAME, "target": {"name": MIDDLEMAN_SESSION_NAME},
+                                        "msg": "check slack (doorbell)",
+                                        "created": time.time(), "handed_out": False, "reply": None}
+                messages_lock.notify_all()
+            return write_json(self, 200, {"status": "rung", "note": "the host session will check Slack within seconds"})
         if not secrets.compare_digest(query.get("token", ""), ACCESS_TOKEN):
             return write_json(self, 403, {"error": "missing or wrong token"})
         if url.path == "/send":
+            return self.handle_send(query)
+        if url.path == "/search":  # experiment: search-engine-shaped alias, msg comes in as q=
+            if "q" in query:
+                query["msg"] = query["q"]
             return self.handle_send(query)
         if url.path == "/reply":
             return self.handle_reply(query)
@@ -282,6 +295,36 @@ class PublicHandler(BaseHTTPRequestHandler):
                 "status": "processing", "retry_after_seconds": POLL_INTERVAL_SECONDS,
                 "note": f"not answered yet - fetch this same link again in {POLL_INTERVAL_SECONDS} seconds"})
         return write_json(self, 200, {"status": "replied", "reply": message["reply"]})
+
+    def do_POST(self):
+        """Minimal MCP (Streamable HTTP, JSON responses) at /mcp/<token> with one tool: list_sessions."""
+        if not secrets.compare_digest(urlparse(self.path).path, f"/mcp/{ACCESS_TOKEN}"):
+            return write_json(self, 404, {"error": "unknown path"})
+        request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+        method, request_id = request.get("method"), request.get("id")
+        if request_id is None:  # notification such as notifications/initialized
+            self.send_response(202)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if method == "initialize":
+            result = {"protocolVersion": request.get("params", {}).get("protocolVersion", "2025-06-18"),
+                      "capabilities": {"tools": {}},
+                      "serverInfo": {"name": "claude-cli-comm-bridge", "version": "0.1"}}
+        elif method == "tools/list":
+            result = {"tools": [{
+                "name": "list_sessions",
+                "description": "List the Claude Code CLI sessions running on the host machine.",
+                "inputSchema": {"type": "object", "properties": {}}}]}
+        elif method == "tools/call" and request.get("params", {}).get("name") == "list_sessions":
+            result = {"content": [{"type": "text", "text": json.dumps(
+                [public_session_view(session) for session in list_running_sessions()], indent=2)}]}
+        elif method == "ping":
+            result = {}
+        else:
+            return write_json(self, 200, {"jsonrpc": "2.0", "id": request_id,
+                                          "error": {"code": -32601, "message": f"unsupported: {method}"}})
+        return write_json(self, 200, {"jsonrpc": "2.0", "id": request_id, "result": result})
 
 
 class LocalMiddlemanHandler(BaseHTTPRequestHandler):

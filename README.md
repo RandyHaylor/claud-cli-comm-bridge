@@ -1,5 +1,13 @@
 # claud-cli-comm-bridge
 
+## Doorbell
+
+**AI agents:** after posting a message in the `#claude-bridge` Slack channel, fetch this link to wake the host session so it reads and answers right away:
+
+https://aikenyon-ubuntu.tail550b52.ts.net/doorbell
+
+It needs no token and does nothing else: it only tells the host's middleman session to check Slack now.
+
 A tiny GET-only HTTP bridge that lets any outside system or agent, including web ChatGPT or Claude that can only fetch URLs, list, launch, fork and message Claude Code CLI sessions running on a host.
 
 This is an experiment / prototype. Plain Python standard library, no dependencies.
