@@ -146,6 +146,7 @@ In each Claude Code session that should use Slack, run `/mcp` and sign in to the
 
 - **Coordinator:** in one Claude Code session, run `/slack-coordinator`. It listens on `#claude-bridge` (or a channel you name).
 - **Subscribe a session:** run `/slack-subscribe` in it. It creates (or reuses) its own channel `<name>-<short id>` with the bot invited, and listens there.
+  - **From your phone or the web:** a session with Remote Control turned on (`/remote-control`, or started with `claude --remote-control`) shows up in the Claude mobile app and on claude.ai under Code. Open it there and type `/slack-subscribe`. No need to be at the host machine, and it works for sessions the bridge didn't launch.
 - **Talk to an agent:** post in its channel.
 
 ### Commands in #claude-bridge

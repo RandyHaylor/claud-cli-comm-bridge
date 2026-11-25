@@ -7,6 +7,8 @@ description: Subscribe this Claude Code session to its own Slack channel through
 
 Sign this session onto Slack: create (or reuse) a channel named after this session, make sure the bridge bot is in it, and listen for messages with an instant ping.
 
+The user can trigger this from anywhere for a session with Remote Control on: they open the session in the Claude mobile app or on claude.ai under Code and type `/slack-subscribe`.
+
 Requirements: the claud-cli-comm-bridge server is running on this machine (its local port, default 8788, override with `BRIDGE_LOCAL_PORT`), the Slack event hub is configured, and this session has the claude.ai Slack connector signed in (if Slack tools fail, tell the user to run `/mcp` and sign in to claude.ai Slack, then stop).
 
 ## Steps
