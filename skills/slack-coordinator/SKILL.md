@@ -36,6 +36,6 @@ Post each result (or the error the endpoint returned) in one short line. Anythin
 
 ## Conventions
 
-Same as slack-subscribe: every post starts with your tag; always post in the main channel, never in threads; keep messages short enough to read on a phone; questions go in uploaded `questions<N>.md` files answered as `questions3.md response: 1a, 2b. 3c: "text"`; long documents go in uploaded `.md` files (upload steps are in the slack-subscribe skill).
+Same as slack-subscribe: every post starts with your tag; always post in the main channel, never in threads; keep messages short and front-loaded (most important sentence first), in plain sentences that sound right read aloud by a voice assistant; end every message with a status line: `STATUS: WORKING`, `STATUS: DONE`, or `STATUS: WAITING FOR USER`; question-file upload comments include the file ID and each question as one short line with its options; questions go in uploaded `questions<N>.md` files answered as `questions3.md response: 1a, 2b. 3c: "text"`; long documents go in uploaded `.md` files (upload steps are in the slack-subscribe skill).
 
 To stop, stop the Monitor and post `<tag> Coordinator stopped.`

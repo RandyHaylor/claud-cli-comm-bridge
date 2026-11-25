@@ -1,0 +1,22 @@
+[Unit]
+Description=claud-cli-comm-bridge Slack event hub and session control
+After=network-online.target
+
+[Service]
+WorkingDirectory=/path/to/claud-cli-comm-bridge
+ExecStart=/usr/bin/python3 /path/to/claud-cli-comm-bridge/bridge_server.py
+Environment=BRIDGE_PUBLIC_PORT=8787
+Environment=BRIDGE_LOCAL_PORT=8788
+Environment=PYTHONUNBUFFERED=1
+# Needed so /launch and /fork can open gnome-terminal windows on the desktop.
+# Must match your desktop session: DISPLAY from `echo $DISPLAY`, UID from `id -u`.
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/run/user/UID/gdm/Xauthority
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/UID/bus
+# Must include the folder holding the claude command
+Environment=PATH=/home/YOUR_USER/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

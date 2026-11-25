@@ -87,13 +87,34 @@ The server reads it on every request (no restart needed). Without it, every even
 
 ### e. Start the server
 
-From a normal terminal, not inside a Claude Code session:
+Recommended: run it as a systemd user service (next section). Manual alternative, from a normal terminal (not inside a Claude Code session): `BRIDGE_PUBLIC_PORT=8787 BRIDGE_LOCAL_PORT=8788 python3 bridge_server.py`
+
+Both port variables are optional (defaults 8787 and 8788). The public port is the one Funnel exposes.
+
+#### Run as a systemd user service
+
+Why: the server keeps running independently of any Claude Code session. Started from inside a session, it dies with that session, and Claude Code also kills idle sessions' background commands when memory runs low.
+
+Install:
 
 ```
-BRIDGE_PUBLIC_PORT=8787 BRIDGE_LOCAL_PORT=8788 python3 bridge_server.py
+mkdir -p ~/.config/systemd/user
+cp systemd/claude-bridge.service.example ~/.config/systemd/user/claude-bridge.service
+# edit it: replace /path/to/claud-cli-comm-bridge, YOUR_USER, UID (id -u) and the DISPLAY value (echo $DISPLAY)
+systemctl --user daemon-reload
+systemctl --user enable --now claude-bridge
 ```
 
-Both variables are optional (defaults 8787 and 8788). The public port is the one Funnel exposes.
+Manage:
+
+```
+systemctl --user status claude-bridge
+systemctl --user restart claude-bridge
+journalctl --user -u claude-bridge -f
+```
+
+- The `DISPLAY`, `XAUTHORITY` and `DBUS_SESSION_BUS_ADDRESS` lines are needed for `/launch` and `/fork` to open terminal windows, and must match your desktop session.
+- A user service runs while you are logged in.
 
 ### f. Verify the Request URL
 
@@ -144,8 +165,39 @@ Anything else is answered by the coordinator itself.
 - Every agent post starts with its tag: `[name · short id · folder]`.
 - Agents acknowledge first (one line saying what they're about to do), then act.
 - Questions come in an uploaded `questions<N>.md` file, numbered, with lettered options. Answer in the main channel without repeating the questions: `questions3.md response: 1a, 2b. 3c: "free text"`.
+- The upload comment for a questions file includes the file ID and each question as one short line with its options, so a reader can answer without opening the file.
 - Long documents come as uploaded `.md` files.
 - No threads: everything is in the main channel.
+- Every agent message ends with a status line: `STATUS: WORKING` (more coming), `STATUS: DONE` (finished), or `STATUS: WAITING FOR USER` (needs an answer).
+- Replies are short, front-loaded (most important sentence first) and written as plain sentences that sound right read aloud by a voice assistant.
+
+### Tips for voice/phone assistants
+
+- Read #readme first.
+- Find the agent's channel by searching for its name.
+- Post in the main channel, never in a thread.
+- Read replies with `oldest` set to your own message's ts.
+- Stop polling when the latest message ends with `STATUS: DONE` or `STATUS: WAITING FOR USER`.
+- Answer a questions file as `questionsN.md response: 1a, 2b. 3: "free text"`.
+
+## Helper scripts
+
+`scripts/` holds small bash wrappers for the service and the local endpoints. They read the local port from `~/.config/claude-bridge/local_port` (default 8788).
+
+Install: `scripts/install.sh [TARGET_FOLDER]` makes them executable and symlinks them into TARGET_FOLDER (default `~/claude-cli-comms-bridge-scripts`). Pick a folder of your choice, or one on your PATH. Or copy them by hand and `chmod +x` them.
+
+| Script | What it does |
+|---|---|
+| `status.sh` | Service status and `tailscale funnel status`. |
+| `start.sh` / `stop.sh` / `restart.sh` | Start, stop or restart the service. |
+| `logs.sh` | Follow the service log. |
+| `sessions.sh` | Table of running sessions. |
+| `launch.sh NAME` | Launch a new session. |
+| `fork.sh FROM NEW_NAME` | Fork a session. |
+| `keys.sh TO TEXT...` | Type text and Enter into a bridge-launched session. |
+| `subscribe.sh NAME` | Type `/slack-subscribe` into a session. |
+| `compact.sh NAME` | Type `/compact` into a session. |
+| `recent-slack.sh [CHANNEL_ID]` | Stored Slack messages, all channels if none given. |
 
 ## Suggested channel content
 
