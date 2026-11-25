@@ -13,6 +13,7 @@ oauth_config:
       - groups:history
       - channels:read
       - groups:read
+      - chat:write
 settings:
   event_subscriptions:
     request_url: https://YOUR-HOST/slack/events

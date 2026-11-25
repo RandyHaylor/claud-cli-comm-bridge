@@ -2,9 +2,9 @@
 
 Slack as the remote interface to Claude Code CLI sessions running on a host machine. Each session gets its own Slack channel; you post there and the session hears it instantly, acts, and replies in the channel.
 
-**Two roles, and only the first is required:**
-- **Agents (any session):** run `/slack-subscribe` and the session listens to its own channel by itself. Talking to an agent never goes through any other agent.
-- **Coordinator (optional, one dedicated session):** run `/slack-coordinator` in one session to handle *actions* posted in the command channel `#claude-bridge`: list, launch and fork sessions, and type commands into them. Without a coordinator, everything still works except those Slack commands; you can still launch and fork with the helper scripts on the host.
+**Two parts:**
+- **Agents (any session):** run `/slack-subscribe` and the session listens to its own channel by itself. Talking to an agent never goes through anything else.
+- **Command channel (`#claude-bridge`), handled by the server itself, no agent needed:** the bridge server runs a fixed set of commands posted there (list, launch and fork sessions, type into them) and posts the result back. It handles only those commands; nothing else is relayed to any agent.
 
 It works from a phone, including Claude voice chat with the claude.ai Slack connector: talk to your phone Claude, it posts in Slack, the host session answers.
 
@@ -40,6 +40,7 @@ Create a new free Slack workspace just for this. You get free rein over channels
 ```
 
 - Slack pushes every message in channels the bot is in to `POST /slack/events`. The server verifies Slack's signature and keeps the last 1000 messages in memory.
+- Messages in the command channel are also parsed as commands. The server answers Slack's request at once, runs the command, and posts the result with `chat.postMessage` using the bot token. Its own posts are bot messages, which the hub drops, so they never loop.
 - Each session runs `slack_listen.py --channel <id>` under its Monitor tool and is woken per message.
 - Sessions post through the claude.ai Slack connector, so all posts appear as the workspace owner. Agents start every post with a tag `[name · short id · folder]`, and the hub drops messages starting with `[`, so agents never hear their own replies.
 
@@ -89,6 +90,18 @@ chmod 600 ~/.config/claude-bridge/slack.env
 
 The server reads it on every request (no restart needed). Without it, every event is refused.
 
+### d2. Bot token (for command channel replies)
+
+The manifest includes the bot scope `chat:write`, which lets the server post replies. If your app was created before that scope was added, add `chat:write` under OAuth & Permissions -> Bot Token Scopes, then reinstall the app to the workspace (Slack prompts for it).
+
+On OAuth & Permissions, copy the Bot User OAuth Token (starts with `xoxb-`). Add it to the same private file, again without putting it on the command line, in chat, or in the repo:
+
+```
+read -s -p "Bot token: " token && printf 'SLACK_BOT_TOKEN=%s\n' "$token" >> ~/.config/claude-bridge/slack.env; unset token
+```
+
+Without the token, commands still run but their replies are not posted (the server logs an error).
+
 ### e. Start the server
 
 Recommended: run it as a systemd user service (next section). Manual alternative, from a normal terminal (not inside a Claude Code session): `BRIDGE_PUBLIC_PORT=8787 BRIDGE_LOCAL_PORT=8788 python3 bridge_server.py`
@@ -133,13 +146,20 @@ In the app's Event Subscriptions page, the Request URL `https://YOUR-HOST/slack/
    echo U0XXXXXXXXX > ~/.config/claude-bridge/slack_bot_user_id
    ```
 
-3. Optional, if you changed the local port: `echo 8788 > ~/.config/claude-bridge/local_port`. The skills read it.
+3. Tell the server which channel is the command channel by saving its channel id (starts with `C`). Find it in Slack under the channel's details, at the bottom of the About tab, or by searching for the channel through the Slack connector:
 
-### h. Install the skills
+   ```
+   echo C0XXXXXXXXX > ~/.config/claude-bridge/command_channel_id
+   ```
+
+   (or set `BRIDGE_COMMAND_CHANNEL_ID` in the service environment). Without it, command handling is off; events are still stored. The server reads it on every event, so no restart is needed.
+
+4. Optional, if you changed the local port: `echo 8788 > ~/.config/claude-bridge/local_port`. The skills read it.
+
+### h. Install the skill
 
 ```
 ln -s "$PWD/skills/slack-subscribe" ~/.claude/skills/slack-subscribe
-ln -s "$PWD/skills/slack-coordinator" ~/.claude/skills/slack-coordinator
 ```
 
 ### i. Sign sessions into the Slack connector
@@ -148,7 +168,7 @@ In each Claude Code session that should use Slack, run `/mcp` and sign in to the
 
 ## Usage
 
-- **Coordinator (optional):** dedicate one Claude Code session to handling actions: run `/slack-coordinator` in it. It listens on `#claude-bridge` (or a channel you name) and carries out commands there. It is not involved in talking to agents; if it's not running, only the `#claude-bridge` commands stop.
+- **Command channel:** post commands in `#claude-bridge`; the server itself runs them and replies. No Claude session is involved.
 - **Subscribe a session:** run `/slack-subscribe` in it. It creates (or reuses) its own channel `<name>-<short id>` with the bot invited, and listens there.
   - **From your phone or the web:** a session with Remote Control turned on (`/remote-control`, or started with `claude --remote-control`) shows up in the Claude mobile app and on claude.ai under Code. Open it there and type `/slack-subscribe`. No need to be at the host machine, and it works for sessions the bridge didn't launch.
 - **Talk to an agent:** post in its channel.
@@ -162,8 +182,10 @@ In each Claude Code session that should use Slack, run `/mcp` and sign in to the
 | `fork FROM NAME` | Forks session FROM (name or short id) into a new session NAME, in FROM's folder. |
 | `keys TO text…` | Types the text into session TO and presses Enter (e.g. `keys my-session /compact`). Only for sessions started by launch or fork. |
 | `subscribe NAME` | Types `/slack-subscribe` into session NAME. Only for sessions started by launch or fork; otherwise type `/slack-subscribe` in that session yourself. |
+| `compact NAME` | Types `/compact` into session NAME. Only for sessions started by launch or fork. |
+| `help` | Lists these commands. |
 
-Anything else is answered by the coordinator itself.
+Commands are matched on the first word, case-insensitive. Anything else gets the help text back. Every reply ends with `STATUS: DONE`. The server handles only these commands; to talk to an agent, post in that agent's own channel.
 
 ### Conventions
 
@@ -229,7 +251,9 @@ launch NAME           start a new session named NAME
 fork FROM NAME        fork session FROM into a new session NAME
 keys TO text...       type text into session TO and press Enter (e.g. keys my-session /compact); bridge-launched sessions only
 subscribe NAME        make session NAME subscribe to its own channel; bridge-launched sessions only
-Anything else is answered by the coordinator.
+compact NAME          type /compact into session NAME; bridge-launched sessions only
+help                  list these commands
+The bridge server answers these itself; anything else gets the help text. To talk to an agent, post in its own channel.
 ```
 
 ### Suggested claude.ai personal preference

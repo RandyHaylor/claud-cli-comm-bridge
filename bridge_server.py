@@ -5,6 +5,10 @@ Public port (exposed through an HTTPS tunnel such as Tailscale Funnel):
   POST /slack/events   Slack Events API receiver, verified by Slack's request signature
                        (SLACK_SIGNING_SECRET from the environment or ~/.config/claude-bridge/slack.env).
                        Stores channel messages, except bot messages and text starting with "[".
+                       Messages in the command channel (BRIDGE_COMMAND_CHANNEL_ID or
+                       ~/.config/claude-bridge/command_channel_id) are also run as commands
+                       (sessions, launch, fork, keys, subscribe, compact, help) and answered with
+                       chat.postMessage using SLACK_BOT_TOKEN (environment or slack.env).
   Anything else gets 404.
 
 Local-only port (bound to 127.0.0.1, never tunneled, no token):
@@ -27,6 +31,7 @@ import re
 import subprocess
 import threading
 import time
+import urllib.request
 from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -176,6 +181,12 @@ class PublicSlackEventsHandler(BaseHTTPRequestHandler):
             store_slack_message({"channel_id": event.get("channel", ""), "ts": event.get("ts", "0"),
                                  "user": event.get("user", ""), "text": event.get("text", ""),
                                  "received_at": time.time()})
+            command_channel_id = read_command_channel_id()
+            # Slack retries carry X-Slack-Retry-Num; the first delivery already ran the command.
+            if (command_channel_id and event.get("channel") == command_channel_id
+                    and not self.headers.get("X-Slack-Retry-Num")):
+                threading.Thread(target=handle_channel_command, args=(command_channel_id, event.get("text", "")),
+                                 daemon=True).start()
         return write_json(self, 200, {"ok": True})
 
 
@@ -186,14 +197,18 @@ slack_messages_lock = threading.Condition()
 
 
 def read_slack_signing_secret():
-    """SLACK_SIGNING_SECRET from the environment, else from ~/.config/claude-bridge/slack.env, else ''."""
-    if os.environ.get("SLACK_SIGNING_SECRET"):
-        return os.environ["SLACK_SIGNING_SECRET"]
+    return read_slack_setting("SLACK_SIGNING_SECRET")
+
+
+def read_slack_setting(setting_name):
+    """setting_name from the environment, else from ~/.config/claude-bridge/slack.env, else ''."""
+    if os.environ.get(setting_name):
+        return os.environ[setting_name]
     try:
         with open(SLACK_SETTINGS_FILE_PATH) as settings_file:
             for line in settings_file:
                 name, _, value = line.strip().partition("=")
-                if name.strip() == "SLACK_SIGNING_SECRET":
+                if name.strip() == setting_name:
                     return value.strip().strip('"').strip("'")
     except OSError:
         pass
@@ -241,11 +256,11 @@ class LocalControlHandler(BaseHTTPRequestHandler):
             return write_json(self, 200, {"sessions": [public_session_view(session)
                                                        for session in list_running_sessions()]})
         if url.path == "/launch":
-            return self.handle_launch(query)
+            return write_json(self, *launch_session(query))
         if url.path == "/fork":
-            return self.handle_fork(query)
+            return write_json(self, *fork_session(query))
         if url.path == "/keys":
-            return self.handle_keys(query)
+            return write_json(self, *send_keys_to_session(query))
         if url.path in ("/slack/messages", "/slack/wait"):
             since_timestamp, channel_id = query.get("since", "0"), query.get("channel", "")
             try:
@@ -262,63 +277,163 @@ class LocalControlHandler(BaseHTTPRequestHandler):
                                           "latest_ts": latest_slack_timestamp(found_messages, since_timestamp)})
         return write_json(self, 404, {"error": "unknown path"})
 
-    def handle_launch(self, query):
-        session_name = query.get("name", "")
-        problem = session_name_problem(session_name)
-        if problem:
-            return write_json(self, *problem)
-        launched_session_names.add(session_name)
-        result = subprocess.run([LAUNCH_SCRIPT_PATH, session_name], capture_output=True, text=True, timeout=30,
-                                env=environment_without_claude_markers())
-        if result.returncode != 0:
-            return write_json(self, 500, {"error": "launch failed", "detail": result.stderr.strip()})
-        launch_output = dict(line.split(": ", 1) for line in result.stdout.strip().splitlines() if ": " in line)
-        return write_json(self, 200, {
-            "status": "launched", "name": session_name, "chat_id": launch_output.get("chat id"),
-            "note": "the session takes a few seconds to start; it appears in /sessions once running"})
 
-    def handle_fork(self, query):
-        source_session, error = resolve_session(query.get("from", ""))
-        if error:
-            return write_json(self, 409 if "matches" in error else 404, error)
-        session_name = query.get("name", "")
-        problem = session_name_problem(session_name)
-        if problem:
-            return write_json(self, *problem)
-        # Claude Code saves each conversation as ~/.claude/projects/<folder>/<session id>.jsonl,
-        # but only after the session's first input; --resume fails without it.
-        if not glob.glob(os.path.join(PROJECTS_DIRECTORY, "*", source_session["session_id"] + ".jsonl")):
-            return write_json(self, 409, {
-                "error": "source session has no saved conversation yet; send it a message first"})
-        launched_session_names.add(session_name)
-        result = subprocess.run(
-            [TMUX_WINDOW_SCRIPT_PATH, session_name, source_session["cwd"],
-             "--resume", source_session["session_id"], "--fork-session"],
-            capture_output=True, text=True, timeout=30, env=environment_without_claude_markers())
-        if result.returncode != 0:
-            return write_json(self, 500, {"error": "fork failed", "detail": result.stderr.strip()})
-        return write_json(self, 200, {
-            "status": "forked", "name": session_name, "from": public_session_view(source_session),
-            "note": "the fork is written to disk only after its first input"})
 
-    def handle_keys(self, query):
-        session, error = resolve_session(query.get("to", ""))
-        if error:
-            return write_json(self, 409 if "matches" in error else 404, error)
-        text = query.get("text", "")
-        if not text:
-            return write_json(self, 400, {"error": "need text="})
-        tmux_pane = find_bridge_tmux_pane_for_process(session["pid"])
-        if not tmux_pane:
-            return write_json(self, 409, {
-                "error": f"{session['name']} is not running inside a bridge tmux session; "
-                         "only sessions started with /launch or /fork can receive keys"})
-        # -l types the text literally; Enter is sent separately so it is pressed, not typed.
-        for keys_arguments in (["-l", text], ["Enter"]):
-            subprocess.run(["tmux", "-L", BRIDGE_TMUX_SERVER, "send-keys", "-t", tmux_pane, *keys_arguments],
-                           check=True, timeout=10)
-            time.sleep(0.3)
-        return write_json(self, 200, {"status": "sent", "to": public_session_view(session), "text": text})
+def launch_session(query):
+    """Returns (http status, body)."""
+    session_name = query.get("name", "")
+    problem = session_name_problem(session_name)
+    if problem:
+        return problem
+    launched_session_names.add(session_name)
+    result = subprocess.run([LAUNCH_SCRIPT_PATH, session_name], capture_output=True, text=True, timeout=30,
+                            env=environment_without_claude_markers())
+    if result.returncode != 0:
+        return 500, {"error": "launch failed", "detail": result.stderr.strip()}
+    launch_output = dict(line.split(": ", 1) for line in result.stdout.strip().splitlines() if ": " in line)
+    return 200, {"status": "launched", "name": session_name, "chat_id": launch_output.get("chat id"),
+                 "note": "the session takes a few seconds to start; it appears in /sessions once running"}
+
+
+def fork_session(query):
+    """Returns (http status, body)."""
+    source_session, error = resolve_session(query.get("from", ""))
+    if error:
+        return (409 if "matches" in error else 404), error
+    session_name = query.get("name", "")
+    problem = session_name_problem(session_name)
+    if problem:
+        return problem
+    # Claude Code saves each conversation as ~/.claude/projects/<folder>/<session id>.jsonl,
+    # but only after the session's first input; --resume fails without it.
+    if not glob.glob(os.path.join(PROJECTS_DIRECTORY, "*", source_session["session_id"] + ".jsonl")):
+        return 409, {"error": "source session has no saved conversation yet; send it a message first"}
+    launched_session_names.add(session_name)
+    result = subprocess.run(
+        [TMUX_WINDOW_SCRIPT_PATH, session_name, source_session["cwd"],
+         "--resume", source_session["session_id"], "--fork-session"],
+        capture_output=True, text=True, timeout=30, env=environment_without_claude_markers())
+    if result.returncode != 0:
+        return 500, {"error": "fork failed", "detail": result.stderr.strip()}
+    return 200, {"status": "forked", "name": session_name, "from": public_session_view(source_session),
+                 "note": "the fork is written to disk only after its first input"}
+
+
+def send_keys_to_session(query):
+    """Returns (http status, body)."""
+    session, error = resolve_session(query.get("to", ""))
+    if error:
+        return (409 if "matches" in error else 404), error
+    text = query.get("text", "")
+    if not text:
+        return 400, {"error": "need text="}
+    tmux_pane = find_bridge_tmux_pane_for_process(session["pid"])
+    if not tmux_pane:
+        return 409, {"error": f"{session['name']} is not running inside a bridge tmux session; "
+                              "only sessions started with /launch or /fork can receive keys"}
+    # -l types the text literally; Enter is sent separately so it is pressed, not typed.
+    for keys_arguments in (["-l", text], ["Enter"]):
+        subprocess.run(["tmux", "-L", BRIDGE_TMUX_SERVER, "send-keys", "-t", tmux_pane, *keys_arguments],
+                       check=True, timeout=10)
+        time.sleep(0.3)
+    return 200, {"status": "sent", "to": public_session_view(session), "text": text}
+
+
+COMMAND_CHANNEL_ID_FILE_PATH = os.path.expanduser("~/.config/claude-bridge/command_channel_id")
+SLACK_API_BASE_URL = os.environ.get("SLACK_API_BASE_URL", "https://slack.com/api")
+COMMAND_HELP_TEXT = """Commands (one per message):
+sessions              list running sessions
+launch NAME           start a new session named NAME
+fork FROM NAME        fork session FROM into a new session NAME
+keys TO text...       type text into session TO and press Enter; bridge-launched sessions only
+subscribe NAME        type /slack-subscribe into session NAME; bridge-launched sessions only
+compact NAME          type /compact into session NAME; bridge-launched sessions only
+help                  this list
+To talk to an agent, post in that agent's own channel. Nothing else is relayed."""
+
+
+def read_command_channel_id():
+    """BRIDGE_COMMAND_CHANNEL_ID from the environment, else ~/.config/claude-bridge/command_channel_id, else ''."""
+    if os.environ.get("BRIDGE_COMMAND_CHANNEL_ID"):
+        return os.environ["BRIDGE_COMMAND_CHANNEL_ID"].strip()
+    try:
+        with open(COMMAND_CHANNEL_ID_FILE_PATH) as channel_id_file:
+            return channel_id_file.read().strip()
+    except OSError:
+        return ""
+
+
+def command_text_without_decoration(text):
+    """Drops Slack's "*Sent using* Claude" footer, surrounding whitespace and markdown (* _ ` ~ >)."""
+    text = re.split(r"\*?Sent using\*?", text, maxsplit=1)[0]
+    return text.strip().strip("*_`~> \n\t").strip()
+
+
+def describe_result(status, body):
+    """Plain-text reply for a (status, body) pair from the session functions."""
+    if status == 200:
+        return "\n".join(f"{key}: {value if not isinstance(value, dict) else value.get('name')}"
+                         for key, value in body.items())
+    return f"Error: {body.get('error', 'failed')}" + (f" ({body['detail']})" if body.get("detail") else "")
+
+
+def sessions_table():
+    sessions = list_running_sessions()
+    if not sessions:
+        return "No running sessions."
+    lines = [f"{'name':<24} {'id':<8} {'status':<8} started"]
+    lines += [f"{session['name']:<24} {session['short_id']:<8} {str(session['status'] or ''):<8} {session['started']}"
+              for session in sessions]
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+def run_channel_command(text):
+    """Parses one command-channel message and returns the reply text (without the status line)."""
+    words = command_text_without_decoration(text).split()
+    command = words[0].lower() if words else "help"
+    arguments = words[1:]
+    if command == "sessions":
+        return sessions_table()
+    if command == "launch" and len(arguments) == 1:
+        return describe_result(*launch_session({"name": arguments[0]}))
+    if command == "fork" and len(arguments) == 2:
+        return describe_result(*fork_session({"from": arguments[0], "name": arguments[1]}))
+    if command == "keys" and len(arguments) >= 2:
+        # the text is the rest of the message after "keys TO", keeping its own spacing
+        keys_text = command_text_without_decoration(text).split(None, 2)[2]
+        return describe_result(*send_keys_to_session({"to": arguments[0], "text": keys_text}))
+    if command in ("subscribe", "compact") and len(arguments) == 1:
+        slash_command = "/slack-subscribe" if command == "subscribe" else "/compact"
+        return describe_result(*send_keys_to_session({"to": arguments[0], "text": slash_command}))
+    return COMMAND_HELP_TEXT
+
+
+def post_slack_message(channel_id, text):
+    """chat.postMessage with SLACK_BOT_TOKEN; logs and skips if no token is configured."""
+    bot_token = read_slack_setting("SLACK_BOT_TOKEN")
+    if not bot_token:
+        print("error: no SLACK_BOT_TOKEN configured; command reply not posted", flush=True)
+        return
+    request = urllib.request.Request(
+        SLACK_API_BASE_URL.rstrip("/") + "/chat.postMessage",
+        data=json.dumps({"channel": channel_id, "text": text}).encode(),
+        headers={"Content-Type": "application/json; charset=utf-8", "Authorization": f"Bearer {bot_token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            answer = json.load(response)
+        if not answer.get("ok"):
+            print(f"error: chat.postMessage failed: {answer.get('error')}", flush=True)
+    except (OSError, ValueError) as error:
+        print(f"error: chat.postMessage failed: {error}", flush=True)
+
+
+def handle_channel_command(channel_id, text):
+    """Runs in its own thread so Slack gets its 200 right away."""
+    try:
+        reply = run_channel_command(text)
+    except Exception as error:  # report any failure in the channel instead of dying silently
+        reply = f"Error: {error}"
+    post_slack_message(channel_id, reply + "\nSTATUS: DONE")
 
 
 if __name__ == "__main__":
